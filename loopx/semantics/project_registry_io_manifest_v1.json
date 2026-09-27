@@ -1655,7 +1655,7 @@
     },
     {
       "site": "loopx/global_registry.py::<module>._sync_project_registry_to_global_once::codec_read:load_registry#1",
-      "line": 649,
+      "line": 647,
       "column": 24,
       "kind": "codec_read",
       "api": "load_registry",
@@ -1663,7 +1663,7 @@
     },
     {
       "site": "loopx/global_registry.py::<module>.sync_project_registry_to_global::codec_read:load_registry#1",
-      "line": 857,
+      "line": 855,
       "column": 22,
       "kind": "codec_read",
       "api": "load_registry",
