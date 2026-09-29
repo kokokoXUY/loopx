@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+
+from loopx.control_plane.testing.canary_harness import (
+    run_json_cli_result,
+    write_fixture_registry,
+)
 
 from loopx.control_plane.work_items.progress_observation import (
     build_replan_action_packet,
@@ -466,3 +474,188 @@ def test_host_projects_evidence_context_and_minimal_action_packet() -> None:
         "blocked",
         "no_followup",
     ]
+
+
+def test_prose_progress_summaries_never_trigger_replan() -> None:
+    """#4336: an `installed` progress summary was read as `stalled`.
+
+    A 0.4.3 install reported `installed` in a progress summary, the prose matcher
+    read that as a stall, and a healthy goal received `autonomous_replan_required`.
+    Typed progress observations replaced the matcher after #3161. This pins the
+    contract that only a typed observation can trigger the repeat rule, so a
+    compatibility matcher cannot bring the prose path back silently.
+    """
+
+    prose_runs = [
+        {
+            "generated_at": f"2026-08-13T01:0{index}:00Z",
+            "agent_id": AGENT_ID,
+            "summary": summary,
+            "note": summary,
+            "status": "ok",
+        }
+        for index, summary in enumerate(
+            (
+                "installed",
+                "uninstalled",
+                "installation completed",
+                "not installed; stalled on the same route again",
+            )
+        )
+    ]
+
+    assert typed_progress_repeat_trigger(prose_runs, agent_id=AGENT_ID) is None
+
+    # An unreadable historical row is not silently upgraded into typed truth
+    # either: prose inside a semantic identifier keeps the run out of the window.
+    unreadable = [
+        dict(run, progress_observation=dict(observation, surface_id="look at the same route again"))
+        for run in (
+            _run("2026-08-13T01:01:00Z", _observation()),
+            _run("2026-08-13T01:00:00Z", _observation()),
+        )
+        for observation in (run["progress_observation"],)
+    ]
+
+    assert typed_progress_repeat_trigger(unreadable, agent_id=AGENT_ID) is None
+
+    # The typed path still triggers, so the guard above is not vacuous.
+    typed_runs = [
+        _run("2026-08-13T01:01:00Z", _observation()),
+        _run("2026-08-13T01:00:00Z", _observation()),
+    ]
+    trigger = typed_progress_repeat_trigger(typed_runs, agent_id=AGENT_ID)
+
+    assert trigger is not None
+    assert trigger["kind"] == "typed_progress_repeat"
+
+GOAL_ID = "prose-progress-cli-fixture"
+TODO_ID = "todo_prose_progress_slice"
+
+
+def _cli_fixture(root: Path) -> tuple[Path, Path]:
+    """Return one isolated active Goal whose only run history is free text."""
+
+    runtime = root / "runtime"
+    registry = root / "registry.json"
+    state_file = root / "state.md"
+    state_file.write_text(
+        "---\nstatus: active\n---\n"
+        "# Prose progress fixture\n\n"
+        "## Objective\n\n"
+        "Keep a healthy installation moving.\n\n"
+        "## Agent Todo\n\n"
+        "- [ ] [P1] Continue the bounded slice.\n"
+        f"  <!-- loopx:todo todo_id={TODO_ID} status=open task_class=advancement_task "
+        f"action_kind=run claimed_by={AGENT_ID} -->\n",
+        encoding="utf-8",
+    )
+    write_fixture_registry(
+        project=root,
+        runtime_root=runtime,
+        registry_path=registry,
+        goal_id=GOAL_ID,
+        domain="prose-progress",
+        adapter_kind="generic_project_goal_v0",
+        state_file=str(state_file),
+        registered_agents=[AGENT_ID],
+        quota_allowed_slots=None,
+    )
+    return registry, runtime
+
+
+def _write_index_jsonl(runtime: Path, newest_first_runs: list[dict[str, object]]) -> None:
+    index = runtime / "goals" / GOAL_ID / "runs" / "index.jsonl"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_text(
+        "".join(json.dumps(run, sort_keys=True) + "\n" for run in newest_first_runs),
+        encoding="utf-8",
+    )
+
+
+def _quota_should_run(registry: Path, runtime: Path, scan_path: Path) -> dict[str, object]:
+    code, packet = run_json_cli_result(
+        "quota",
+        "should-run",
+        "--goal-id",
+        GOAL_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--scan-path",
+        str(scan_path),
+        registry_path=registry,
+        runtime_root=runtime,
+    )
+    assert code == 0, packet
+    return packet
+
+
+def _successful_prose_run(generated_at: str, summary: str) -> dict[str, object]:
+    return {
+        "generated_at": generated_at,
+        "goal_id": GOAL_ID,
+        "agent_id": AGENT_ID,
+        "classification": "bounded_replan_progress",
+        "turn_instance_id": f"turn-{generated_at}",
+        "status": "ok",
+        "summary": summary,
+        "note": summary,
+    }
+
+
+@pytest.mark.parametrize("summary", ["installed", "uninstalled", "installation completed"])
+def test_public_quota_never_replans_from_prose_run_history(tmp_path: Path, summary: str) -> None:
+    """#4336 at the public boundary: the real `quota should-run` stays quiet.
+
+    The helper-level test above pins the codec. This one pins the consumer a user
+    actually runs, so a prose compatibility matcher reintroduced anywhere below
+    the public CLI fails here even while the helper test stays green.
+    """
+
+    registry, runtime = _cli_fixture(tmp_path)
+    _write_index_jsonl(
+        runtime,
+        [
+            _successful_prose_run("2026-09-01T00:03:00+00:00", summary),
+            _successful_prose_run("2026-09-01T00:02:00+00:00", summary),
+            _successful_prose_run("2026-09-01T00:01:00+00:00", "uninstalled"),
+            _successful_prose_run("2026-09-01T00:00:00+00:00", "installation completed"),
+        ],
+    )
+
+    packet = _quota_should_run(registry, runtime, tmp_path)
+
+    assert packet["decision"] != "autonomous_replan_required"
+    assert packet.get("replan_action_packet") is None
+    assert packet["requires_user_action"] is False
+    serialized = json.dumps(packet)
+    assert "autonomous_replan" not in serialized
+    assert "typed_progress_repeat" not in serialized
+
+
+def test_public_quota_still_replans_from_typed_run_history(tmp_path: Path) -> None:
+    """The typed repeat rule keeps reaching the same public consumer."""
+
+    registry, runtime = _cli_fixture(tmp_path)
+    _write_index_jsonl(
+        runtime,
+        [
+            {
+                **_successful_prose_run("2026-09-01T00:01:00+00:00", "installed"),
+                "progress_observation": normalize_progress_observation(_observation()),
+            },
+            {
+                **_successful_prose_run("2026-09-01T00:00:00+00:00", "installed"),
+                "progress_observation": normalize_progress_observation(_observation()),
+            },
+        ],
+    )
+
+    packet = _quota_should_run(registry, runtime, tmp_path)
+    obligation = packet["replan_action_packet"]
+
+    assert packet["decision"] == "autonomous_replan_required"
+    assert isinstance(obligation, dict)
+    assert obligation["decision"] == "replan_required"
+    assert str(obligation["obligation_id"]).startswith("replan-")
+    assert obligation["required_outcome"]
